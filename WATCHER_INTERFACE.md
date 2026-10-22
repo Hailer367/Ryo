@@ -168,14 +168,17 @@ For strong per-hop slippage protection, the watcher should encode an explicit `m
 `extraData` for each swap in addition to `minProfit`. The primary routes intentionally use only the
 non-zero `1` floor and rely on `minProfit`.
 
-### 3.4 Trade size and gas price
+### 3.4 Trade size and gas price (optional backstops)
 
-- `maxTradeSize[asset]`: maximum borrow amount per execution. `0` means unlimited.
-  Exceeding it reverts with `TradeSizeExceeded(asset, amount, maxAmount)`.
-- `maxGasPrice`: maximum `tx.gasprice`. `0` disables the check.
-  Exceeding it reverts with `GasPriceTooHigh(maxGasPrice, actualGasPrice)`.
+- `maxTradeSize[asset]`: maximum borrow amount per execution. Defaults to `0`, which means
+  **unlimited** — Ryo accepts any trade size the bot asks for. Set a number to add a hard ceiling
+  on top of the bot's own sizing.
+- `maxGasPrice`: maximum `tx.gasprice`. Defaults to `0`, which **disables** the check. Set a
+  number to add a hard ceiling on top of the bot's own gas check.
 - Both checks happen before the flash loan. The gas-price check applies to `execute` and
   `executePrimary`, not to simulations.
+- **The bot is the primary safety net.** Ryo trusts the bot to size trades correctly; these
+  limits exist so the owner can add a second line of defense if they want one. See section 12.
 
 ### 3.5 Router whitelist
 
@@ -533,6 +536,31 @@ References:
 - Base contracts: <https://docs.base.org/base-contracts>
 
 ---
+
+## 12. Bot safety nets (the primary protection)
+
+Ryo is deliberately permissive. It accepts any trade size and any gas price by default, because the
+bot is expected to be the thing that keeps itself safe. The bot has live price, liquidity and gas
+data that the contract cannot see, so the bot is in a better position to make those calls. The
+contract's `maxTradeSize` and `maxGasPrice` are optional backstops, not the primary protection.
+
+A bot integrating with Ryo should implement at least:
+
+1. **Liquidity-aware sizing.** Read the reserves of every pool on the route and size the trade to a
+   small fraction (e.g. 1–2%) of the shallowest pool. Never exceed the pool's depth.
+2. **Simulate first.** Call `simulate` (which always reverts with the profit) and only execute if
+   the expected profit clears a threshold with margin.
+3. **Gas check.** Refuse to trade when `tx.gasprice` exceeds the configured budget.
+4. **Route validation.** Re-check coherence, router whitelist and `extraData` lengths client-side.
+5. **Per-hop slippage.** Encode an explicit `minAmountOut` in every swap's `extraData`, not just
+   the default of `1`.
+6. **Circuit breaker.** Track consecutive failures; if a few happen in a row, pause the bot and
+   alert a human.
+7. **Balance check.** Verify the contract holds no funds before and after (it shouldn't, ever).
+8. **Rate limiting.** Don't spam the chain; a failed trade is cheap, a successful one is the goal.
+
+The contract's `minProfit` floor is the last line of defense and is always enforced: even if
+everything else goes wrong, a trade that doesn't beat `minProfit` reverts and no money is lost.
 
 ## 11. Interface assumptions and differences from common DEX APIs
 

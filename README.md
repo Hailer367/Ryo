@@ -249,8 +249,9 @@ The script prints the deployed address, owner, operator, and primary routes.
 
 - Route 0: borrow WETH -> USDC on Uniswap V3 fee 500 -> WETH on Uniswap V2.
 - Route 1: borrow USDC -> WETH on Uniswap V3 fee 500 -> USDC on Uniswap V2.
-- Per-asset caps: `1 ether` WETH and `2,500 USDC` (adjust before deploying).
-- `MAX_GAS_PRICE=50 gwei`.
+- Per-asset caps: `0` (unlimited) — the bot is the primary safety net. Set a number to add a
+  hard ceiling on top of the bot's own limits.
+- `MAX_GAS_PRICE=0` (disabled) — the bot checks gas itself.
 - Routers are auto-whitelisted.
 
 The primary route configuration is immutable. To change a route, deploy a new executor.
