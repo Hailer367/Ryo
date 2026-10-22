@@ -17,43 +17,49 @@ their own gas, and transaction calldata contributes intrinsic gas.
 
 | Path | Gas | Notes |
 | --- | ---: | --- |
-| `executePrimary(0, 10e18, minProfit)` | 457,877 | Two immutable swaps, one-byte userData |
-| `execute(token, 10e18, swaps, minProfit)` | 469,441 | Same two swaps as a dynamic `Swap[]` |
+| `executePrimary(0, 10e18, minProfit)` | 507,605 | Two immutable swaps, one-byte userData |
+| `execute(token, 10e18, swaps, minProfit)` | 519,306 | Same two swaps as a dynamic `Swap[]` |
 
-`executePrimary` saves **11,564 gas (~2.5%)** in this mock comparison by avoiding dynamic route
+`executePrimary` saves **11,701 gas (~2.3%)** in this mock comparison by avoiding dynamic route
 validation/decoding and the larger calldata encoding pass. The gap grows with route length and
 calldata size; it shrinks relative to the real Vault/router overhead.
 
 ## Assembly paths
 
+Only two hand-written assembly paths exist, and each one is kept because it measurably wins. The
+comparison uses two Ryo-derived contracts (`RyoHarness` and `RyoPlainReference`) with identical
+function shapes, both called cold from the same state, so the only difference is how the calldata is
+produced.
+
 | Path | Gas | Saved |
 | --- | ---: | ---: |
-| V3 `exactInputSingle` — assembly calldata | 307,677 | **817 (~0.27%)** |
-| V3 `exactInputSingle` — plain ABI reference | 308,494 | — |
-| V3 `extraData` decode — assembly | 4,547 | **1,581 (~26%)** |
-| V3 `extraData` decode — plain reference | 6,128 | — |
+| V3 `exactInputSingle` — hand-written calldata | 285,510 | **2,464** |
+| V3 `exactInputSingle` — plain ABI reference | 287,974 | — |
 
-Both assembly paths are differential-tested against plain Solidity:
+The hand-written path writes `4 + 7*32 = 228` bytes directly and skips constructing the
+`ExactInputSingleParams` struct. Its output is byte-for-byte identical to the plain reference,
+which the differential tests check on every run (including a fuzzed fee and amount).
+
+### A decoder that did not earn its place
+
+An assembly decoder for the V3 `extraData` was written and measured against a plain reference. It
+came out **22 gas slower** (4,521 vs 4,499), so it was removed and the plain decoder was kept. The
+plain decoder also rejects non-canonical encodings, while the assembly version silently masked the
+high bits of the fee.
 
 ```bash
-forge test --match-path test/RyoAssembly.t.sol -vv
+forge test --match-test 'test_gas_' -vv
 ```
-
-The calldata path writes `4 + 7*32 = 228` bytes directly and skips constructing the `ExactInputSingleParams`
-struct. The decoder avoids a dynamic `abi.decode` for the common 32-byte fee-only case. Both savings
-are repeatable, so the assembly is retained.
-
-The 64-byte decoder case also avoids full ABI decoding. The fuzz tests compare both lengths against
-the plain reference.
 
 ## Contract size
 
 ```text
-Ryo runtime:  19,007 bytes (5,569 bytes under the 24,576-byte EIP-170 limit)
-Ryo initcode: 21,224 bytes
+Ryo runtime:  22,454 bytes (2,122 bytes under the 24,576-byte EIP-170 limit)
+Ryo initcode: 24,678 bytes
 ```
 
-`RyoHarness` exceeds the runtime limit, but it is test-only and never deployed.
+`RyoHarness` (22,879 bytes) and `RyoPlainReference` (23,706 bytes) are test-only and never
+deployed.
 
 ## Reproduce
 

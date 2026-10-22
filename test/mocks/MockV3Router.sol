@@ -8,6 +8,10 @@ contract MockV3Router is ISwapRouter02 {
     mapping(address => mapping(address => uint256)) public rateE18; // out = in * rate / 1e18
     bool public failNext;
     bytes public lastCalldata;
+    uint24 public lastFee;
+    uint256 public lastAmountOutMinimum;
+    address public lastRecipient;
+    bool public pullTokens = true;
 
     function setRate(address tokenIn, address tokenOut, uint256 rate) external {
         rateE18[tokenIn][tokenOut] = rate;
@@ -17,6 +21,12 @@ contract MockV3Router is ISwapRouter02 {
         failNext = fail;
     }
 
+    /// @dev When disabled the mock records the call but does not pull tokens, which lets the gas
+    ///      test compare the two calldata encodings without any approval in the way.
+    function setPullTokens(bool pull) external {
+        pullTokens = pull;
+    }
+
     function exactInputSingle(ExactInputSingleParams calldata params)
         external
         payable
@@ -24,10 +34,17 @@ contract MockV3Router is ISwapRouter02 {
     {
         if (failNext) revert("MockV3: forced failure");
         lastCalldata = msg.data;
+        lastFee = params.fee;
+        lastAmountOutMinimum = params.amountOutMinimum;
+        lastRecipient = params.recipient;
 
-        IERC20(params.tokenIn).transferFrom(msg.sender, address(this), params.amountIn);
+        if (pullTokens) {
+            IERC20(params.tokenIn).transferFrom(msg.sender, address(this), params.amountIn);
+        }
         amountOut = (params.amountIn * rateE18[params.tokenIn][params.tokenOut]) / 1e18;
         require(amountOut >= params.amountOutMinimum, "MockV3: slippage");
-        IERC20(params.tokenOut).transfer(params.recipient, amountOut);
+        if (pullTokens) {
+            IERC20(params.tokenOut).transfer(params.recipient, amountOut);
+        }
     }
 }

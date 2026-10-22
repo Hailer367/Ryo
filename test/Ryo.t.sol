@@ -14,6 +14,8 @@ import { MockFeeERC20 } from "./mocks/MockFeeERC20.sol";
 import { MockBalancerVault } from "./mocks/MockBalancerVault.sol";
 import { MockV2Router } from "./mocks/MockV2Router.sol";
 import { MockV3Router } from "./mocks/MockV3Router.sol";
+import { MockAerodromeRouter } from "./mocks/MockAerodromeRouter.sol";
+import { MockSlipstreamSwapRouter } from "./mocks/MockSlipstreamSwapRouter.sol";
 import { ReentrantV2Router } from "./mocks/ReentrantV2Router.sol";
 
 contract RyoTest is Test {
@@ -25,6 +27,8 @@ contract RyoTest is Test {
     MockBalancerVault internal vault;
     MockV2Router internal v2;
     MockV3Router internal v3;
+    MockAerodromeRouter internal aero;
+    MockSlipstreamSwapRouter internal slipstream;
     MockERC20 internal tokenA;
     MockERC20 internal tokenB;
     MockERC20 internal tokenC;
@@ -36,6 +40,8 @@ contract RyoTest is Test {
         vault = new MockBalancerVault();
         v2 = new MockV2Router();
         v3 = new MockV3Router();
+        aero = new MockAerodromeRouter();
+        slipstream = new MockSlipstreamSwapRouter();
 
         tokenA = new MockERC20("Token A", "A", 18);
         tokenB = new MockERC20("Token B", "B", 18);
@@ -49,10 +55,18 @@ contract RyoTest is Test {
         tokenB.mint(address(v3), 1_000_000 * ONE);
         tokenC.mint(address(v2), 1_000_000 * ONE);
         tokenC.mint(address(v3), 1_000_000 * ONE);
+        tokenA.mint(address(aero), 1_000_000 * ONE);
+        tokenB.mint(address(aero), 1_000_000 * ONE);
+        tokenA.mint(address(slipstream), 1_000_000 * ONE);
+        tokenB.mint(address(slipstream), 1_000_000 * ONE);
 
         // Default profitable route: A -> B on V3 at 1.1, B -> A on V2 at 1.0.
         v3.setRate(address(tokenA), address(tokenB), 1.1e18);
+        v3.setRate(address(tokenB), address(tokenA), 1.0e18);
         v2.setRate(address(tokenB), address(tokenA), 1.0e18);
+        // Aerodrome and Slipstream legs are better than the V3 leg, so routes through them profit.
+        aero.setRate(address(tokenA), address(tokenB), 1.2e18);
+        slipstream.setRate(address(tokenA), address(tokenB), 1.3e18);
 
         ryo = new Ryo(
             address(vault),
@@ -65,6 +79,9 @@ contract RyoTest is Test {
             100 * ONE,
             0
         );
+
+        ryo.setRouterWhitelist(address(aero), true);
+        ryo.setRouterWhitelist(address(slipstream), true);
     }
 
     // ----------------------------------------------------------------------------------------
@@ -121,6 +138,20 @@ contract RyoTest is Test {
             tokenOut: address(tokenA),
             extraData: ""
         });
+    }
+
+    /// @dev Aerodrome extraData: the token path, one stable/volatile flag per hop, and the floor.
+    function _aeroExtra(address tokenIn, address tokenOut, bool stable, uint256 minOut)
+        internal
+        pure
+        returns (bytes memory)
+    {
+        address[] memory path = new address[](2);
+        path[0] = tokenIn;
+        path[1] = tokenOut;
+        bool[] memory stables = new bool[](1);
+        stables[0] = stable;
+        return abi.encode(path, stables, minOut);
     }
 
     // ----------------------------------------------------------------------------------------
@@ -238,6 +269,203 @@ contract RyoTest is Test {
         vm.prank(OPERATOR);
         uint256 profit = ryo.execute(address(tokenA), 10 * ONE, swaps, ONE);
         assertEq(profit, ONE);
+    }
+
+    function test_v3ExtraDataFeeAndFloorReachTheRouter() public {
+        Ryo.Swap[] memory swaps = _primarySwaps();
+        swaps[0].extraData = abi.encode(uint24(3000), uint256(12345));
+
+        vm.prank(OPERATOR);
+        ryo.execute(address(tokenA), 10 * ONE, swaps, 0);
+
+        assertEq(v3.lastFee(), uint24(3000), "decoded fee");
+        assertEq(v3.lastAmountOutMinimum(), uint256(12345), "decoded floor");
+        assertEq(v3.lastRecipient(), address(ryo), "recipient");
+    }
+
+    function test_v3ExtraDataZeroFloorBecomesOne() public {
+        Ryo.Swap[] memory swaps = _primarySwaps();
+        swaps[0].extraData = abi.encode(uint24(500), uint256(0));
+
+        vm.prank(OPERATOR);
+        ryo.execute(address(tokenA), 10 * ONE, swaps, 0);
+
+        assertEq(v3.lastAmountOutMinimum(), uint256(1), "zero floor normalized to one");
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Aerodrome and Slipstream adapters
+    // ----------------------------------------------------------------------------------------
+
+    function test_execute_aerodromeVolatileRoute() public {
+        Ryo.Swap[] memory swaps = new Ryo.Swap[](2);
+        swaps[0] = Ryo.Swap({
+            dexType: 4,
+            router: address(aero),
+            tokenIn: address(tokenA),
+            tokenOut: address(tokenB),
+            extraData: _aeroExtra(address(tokenA), address(tokenB), false, 1)
+        });
+        swaps[1] = Ryo.Swap({
+            dexType: 6,
+            router: address(v3),
+            tokenIn: address(tokenB),
+            tokenOut: address(tokenA),
+            extraData: abi.encode(uint24(500))
+        });
+
+        vm.prank(OPERATOR);
+        uint256 profit = ryo.execute(address(tokenA), 10 * ONE, swaps, 2 * ONE);
+
+        assertEq(profit, 2 * ONE, "Aerodrome profit");
+        assertEq(tokenA.balanceOf(address(ryo)), 0, "contract holds nothing");
+        (address from, address to, bool stable, address factory) = aero.lastRoutes(0);
+        assertEq(from, address(tokenA), "hop from");
+        assertEq(to, address(tokenB), "hop to");
+        assertFalse(stable, "volatile pool flag");
+        assertEq(factory, address(0), "default factory");
+    }
+
+    function test_execute_aerodromeStableRoute() public {
+        Ryo.Swap[] memory swaps = new Ryo.Swap[](2);
+        swaps[0] = Ryo.Swap({
+            dexType: 4,
+            router: address(aero),
+            tokenIn: address(tokenA),
+            tokenOut: address(tokenB),
+            extraData: _aeroExtra(address(tokenA), address(tokenB), true, 1)
+        });
+        swaps[1] = Ryo.Swap({
+            dexType: 6,
+            router: address(v3),
+            tokenIn: address(tokenB),
+            tokenOut: address(tokenA),
+            extraData: abi.encode(uint24(500))
+        });
+
+        vm.prank(OPERATOR);
+        ryo.execute(address(tokenA), 10 * ONE, swaps, 0);
+
+        (,, bool stable,) = aero.lastRoutes(0);
+        assertTrue(stable, "stable pool flag");
+    }
+
+    function test_execute_slipstreamRoute() public {
+        Ryo.Swap[] memory swaps = new Ryo.Swap[](2);
+        swaps[0] = Ryo.Swap({
+            dexType: 7,
+            router: address(slipstream),
+            tokenIn: address(tokenA),
+            tokenOut: address(tokenB),
+            extraData: abi.encode(int24(10))
+        });
+        swaps[1] = Ryo.Swap({
+            dexType: 6,
+            router: address(v3),
+            tokenIn: address(tokenB),
+            tokenOut: address(tokenA),
+            extraData: abi.encode(uint24(500))
+        });
+
+        vm.prank(OPERATOR);
+        uint256 profit = ryo.execute(address(tokenA), 10 * ONE, swaps, 3 * ONE);
+
+        assertEq(profit, 3 * ONE, "Slipstream profit");
+        assertEq(slipstream.lastTickSpacing(), int24(10), "tick spacing passed through");
+        assertEq(slipstream.lastRecipient(), address(ryo), "recipient");
+        assertEq(slipstream.lastDeadline(), block.timestamp, "deadline");
+    }
+
+    function test_RevertWhen_aerodromeExtraDataTooShort() public {
+        Ryo.Swap[] memory swaps = _primarySwaps();
+        swaps[1] = Ryo.Swap({
+            dexType: 4,
+            router: address(aero),
+            tokenIn: address(tokenB),
+            tokenOut: address(tokenA),
+            extraData: abi.encode(uint256(1))
+        });
+        vm.expectRevert(abi.encodeWithSelector(Ryo.InvalidExtraData.selector, 1));
+        vm.prank(OPERATOR);
+        ryo.execute(address(tokenA), ONE, swaps, 0);
+    }
+
+    function test_RevertWhen_aerodromePathMismatch() public {
+        Ryo.Swap[] memory swaps = _primarySwaps();
+        swaps[1] = Ryo.Swap({
+            dexType: 4,
+            router: address(aero),
+            tokenIn: address(tokenB),
+            tokenOut: address(tokenA),
+            extraData: _aeroExtra(address(tokenB), address(tokenC), false, 1)
+        });
+        vm.expectRevert(abi.encodeWithSelector(Ryo.InvalidPath.selector, 1));
+        vm.prank(OPERATOR);
+        ryo.execute(address(tokenA), ONE, swaps, 0);
+    }
+
+    function test_RevertWhen_aerodromeStableFlagCountMismatch() public {
+        address[] memory path = new address[](2);
+        path[0] = address(tokenB);
+        path[1] = address(tokenA);
+        bool[] memory stables = new bool[](2); // one hop, two flags
+
+        Ryo.Swap[] memory swaps = _primarySwaps();
+        swaps[1] = Ryo.Swap({
+            dexType: 4,
+            router: address(aero),
+            tokenIn: address(tokenB),
+            tokenOut: address(tokenA),
+            extraData: abi.encode(path, stables, uint256(1))
+        });
+        vm.expectRevert(abi.encodeWithSelector(Ryo.InvalidPath.selector, 1));
+        vm.prank(OPERATOR);
+        ryo.execute(address(tokenA), ONE, swaps, 0);
+    }
+
+    function test_RevertWhen_slipstreamExtraDataBadLength() public {
+        Ryo.Swap[] memory swaps = _primarySwaps();
+        swaps[1] = Ryo.Swap({
+            dexType: 7,
+            router: address(slipstream),
+            tokenIn: address(tokenB),
+            tokenOut: address(tokenA),
+            extraData: hex"001122"
+        });
+        vm.expectRevert(abi.encodeWithSelector(Ryo.InvalidExtraData.selector, 1));
+        vm.prank(OPERATOR);
+        ryo.execute(address(tokenA), ONE, swaps, 0);
+    }
+
+    function test_RevertWhen_aerodromeRouterNotWhitelisted() public {
+        ryo.setRouterWhitelist(address(aero), false);
+        Ryo.Swap[] memory swaps = new Ryo.Swap[](2);
+        swaps[0] = Ryo.Swap({
+            dexType: 4,
+            router: address(aero),
+            tokenIn: address(tokenA),
+            tokenOut: address(tokenB),
+            extraData: _aeroExtra(address(tokenA), address(tokenB), false, 1)
+        });
+        swaps[1] = Ryo.Swap({
+            dexType: 6,
+            router: address(v3),
+            tokenIn: address(tokenB),
+            tokenOut: address(tokenA),
+            extraData: abi.encode(uint24(500))
+        });
+        vm.expectRevert(abi.encodeWithSelector(Ryo.RouterNotWhitelisted.selector, address(aero)));
+        vm.prank(OPERATOR);
+        ryo.execute(address(tokenA), ONE, swaps, 0);
+    }
+
+    function test_isSupportedDexType() public {
+        assertTrue(ryo.isSupportedDexType(4), "Aerodrome");
+        assertTrue(ryo.isSupportedDexType(6), "Uniswap V3");
+        assertTrue(ryo.isSupportedDexType(7), "Slipstream");
+        assertTrue(ryo.isSupportedDexType(8), "Uniswap V2");
+        assertFalse(ryo.isSupportedDexType(5), "Curve");
+        assertFalse(ryo.isSupportedDexType(99), "unknown");
     }
 
     // ----------------------------------------------------------------------------------------

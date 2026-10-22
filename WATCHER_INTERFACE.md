@@ -75,6 +75,9 @@ execute(address,uint256,(uint8,address,address,address,bytes)[],uint256)
   is negative or `< minProfit`.
 - Returns the profit that was transferred to `owner()`.
 
+Supported adapters in `swaps[].dexType`: `4` Aerodrome classic, `6` Uniswap V3, `7` Aerodrome
+Slipstream, `8` Uniswap V2-style. See section 4 for the `extraData` encoding of each.
+
 ### 2.2 Immutable primary route
 
 ```solidity
@@ -180,6 +183,13 @@ Every `router` must be whitelisted. Routing is checked before the loan and re-ch
 callback. Primary routers are auto-whitelisted at deployment. The owner can add or remove routers
 with `setRouterWhitelist`.
 
+To use Aerodrome or Slipstream, the owner must whitelist their routers once:
+
+```solidity
+ryo.setRouterWhitelist(0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43, true); // Aerodrome classic
+ryo.setRouterWhitelist(0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5, true); // Aerodrome Slipstream
+```
+
 If the owner removes a primary route's router, that primary route stops working until it is
 re-added or the contract is redeployed.
 
@@ -250,18 +260,89 @@ Rules:
 - `minAmountOut = 0` is normalized to `1`.
 - Ryo calls `swapExactTokensForTokens(amountIn, minAmountOut, path, address(ryo), block.timestamp)`.
 
+### 4.3 `dexType = 4` — Aerodrome classic (volatile and stable pools)
+
+Aerodrome's router takes a list of **hops** rather than a plain token list, and every hop says
+whether its pool is a "stable" pool (pegged assets) or a "volatile" one.
+
+| Length | Encoding | Meaning |
+| --- | --- | --- |
+| `>= 256` bytes, multiple of 32 | `abi.encode(address[] path, bool[] stablePerHop, uint256 minAmountOut)` | Token path, one pool-type flag per hop, output floor |
+
+Example:
+
+```solidity
+address[] memory path = new address[](2);
+path[0] = USDC;
+path[1] = WETH;
+bool[] memory stablePerHop = new bool[](1);
+stablePerHop[0] = false; // volatile pool
+bytes memory extra = abi.encode(path, stablePerHop, uint256(1));
+```
+
+Rules:
+
+- `path.length >= 2`.
+- `stablePerHop.length == path.length - 1` — one flag per hop.
+- `path[0] == swap.tokenIn`, `path[path.length - 1] == swap.tokenOut`.
+- No zero addresses in `path`.
+- `minAmountOut = 0` is normalized to `1`.
+- The encoding must be exact: `extraData.length == 32 * (5 + path.length + stablePerHop.length)`.
+  Trailing junk is rejected with `InvalidExtraData`.
+- The pool factory is always the router's default factory. To trade a pool from a different
+  Aerodrome factory, point `swap.router` at the router of that factory.
+- Ryo calls
+  `swapExactTokensForTokens(amountIn, minAmountOut, routes, address(ryo), block.timestamp)` where
+  each route is `{from: path[i], to: path[i+1], stable: stablePerHop[i], factory: address(0)}`.
+
+### 4.4 `dexType = 7` — Aerodrome Slipstream (concentrated liquidity)
+
+Slipstream is Aerodrome's Uniswap-V3-style concentrated liquidity AMM. Its router identifies a
+pool by **tick spacing** rather than a fee tier, and it carries an extra deadline field.
+
+| Length | Encoding | Meaning |
+| --- | --- | --- |
+| 32 bytes | `abi.encode(int24 tickSpacing)` | Tick spacing; `minAmountOut = 1` |
+| 64 bytes | `abi.encode(int24 tickSpacing, uint256 minAmountOut)` | Tick spacing and explicit floor |
+
+Example:
+
+```solidity
+abi.encode(int24(1))                     // 32 bytes, tick spacing 1
+abi.encode(int24(1), uint256(1_000e6))   // 64 bytes, tick spacing 1 with a floor
+```
+
+Rules:
+
+- `tickSpacing` is signed and must be a valid Slipstream tick spacing for the pool.
+- `minAmountOut = 0` is normalized to `1`.
+- Ryo calls `exactInputSingle` with
+  `(tokenIn, tokenOut, tickSpacing, recipient, deadline = block.timestamp, amountIn, amountOutMinimum, sqrtPriceLimitX96 = 0)`.
+
 ### 4.3 `dexType` ids
 
 | ID | Adapter | Status |
 | --- | --- | --- |
+| `4` | Aerodrome classic (volatile + stable pools) | Implemented |
 | `6` | Uniswap V3 / SwapRouter02 | Implemented |
+| `7` | Aerodrome Slipstream (concentrated liquidity) | Implemented |
 | `8` | Uniswap V2-style `swapExactTokensForTokens` | Implemented |
 
 Reserved and currently unsupported: `1` canonical Uniswap V2, `2` SushiSwap V2, `3` PancakeSwap V2,
-`4` Aerodrome, `5` Curve, `7` Algebra/Uniswap V3 forks with a different router ABI, `9` WOOFi,
-`10` Maverick. Any other value reverts with `UnsupportedDexType(id)`. Do not reuse ids.
+`5` Curve, `9` WOOFi, `10` Maverick, `11` Algebra (concentrated liquidity with a different router
+ABI). Any other value reverts with `UnsupportedDexType(id)`. Do not reuse ids.
 
 The exact set is queryable with `isSupportedDexType(uint8)`.
+
+> **Note:** Uniswap V2 and other classic V2-style routers (SushiSwap, PancakeSwap, BaseSwap) are
+> *not* limited to `dexType 8`. Any router exposing the standard
+> `swapExactTokensForTokens(amountIn, minOut, path, to, deadline)` ABI can be whitelisted and used
+> with `dexType 8` today — no contract change needed. `dexType 8` does not check which factory the
+> router belongs to.
+>
+> `dexType 4` and `dexType 7` are needed because Aerodrome's routers speak a different language:
+> Aerodrome classic takes a list of "route hops" instead of a token list, and Slipstream identifies
+> pools by tick spacing instead of a fee tier.
 
 ---
 
@@ -429,17 +510,24 @@ the official deployment registries and on-chain code; this document does not inv
 | Uniswap V3 SwapRouter02 | `0x2626664c2603336E57B271c5C0b26F421741e481` |
 | Uniswap V2 Router02 | `0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24` |
 | Uniswap V2 Factory | `0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6` |
+| Aerodrome Router | `0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43` |
+| Aerodrome PoolFactory | `0x420DD381b31aEf6683db6B902084cB0FFECe40Da` |
+| Aerodrome Slipstream SwapRouter | `0xBE6D8f0d05cC4be24d5167a3eF062215bE6D18a5` |
+| Aerodrome Slipstream PoolFactory | `0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A` |
 | WETH | `0x4200000000000000000000000000000000000006` |
 | USDC | `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` |
 | Uniswap V3 WETH/USDC 0.01% pool | `0xb4CB800910B228ED3d0834cF79D697127BBB00e5` |
 | Uniswap V3 WETH/USDC 0.05% pool | `0xd0b53D9277642d899DF5C87A3966A349A798F224` |
 | Uniswap V3 WETH/USDC 0.30% pool | `0x6c561B446416E1A00E8E93E221854d6eA4171372` |
 | Uniswap V2 WETH/USDC pair | `0x88A43bbDF9D098eEC7bCEda4e2494615dfD9bB9C` |
+| Aerodrome WETH/USDC volatile pool | `0xcDAC0d6c6C59727a65F871236188350531885C43` |
+| Aerodrome WETH/USDC stable pool | `0x3548029694fbB241D45FB24Ba0cd9c9d4E745f16` |
 
 References:
 
 - Balancer deployments: <https://github.com/balancer/balancer-deployments>
 - Balancer flash loans: <https://docs.balancer.fi/developer-reference/contracts/flash-loans.html>
+- Aerodrome docs: <https://aerodrome.finance/docs>
 - Uniswap V3 Base deployments: <https://docs.uniswap.org/contracts/v3/reference/deployments/base-deployments>
 - Uniswap V2 deployment addresses: <https://docs.uniswap.org/contracts/v2/reference/smart-contracts/v2-deployments>
 - Base contracts: <https://docs.base.org/base-contracts>
@@ -456,12 +544,22 @@ References:
 4. **Ryo supports ERC20 assets only.** Native ETH is not borrowed or routed; use WETH. The contract
    can receive ETH only for forced/accidental balances and owner rescue.
 5. **The V3 adapter targets `SwapRouter02`-compatible routers.** `SwapRouter` (with deadline) and
-   Algebra-style routers use different ABIs and need a new adapter id.
+   Algebra-style routers use different ABIs and need a new adapter id. Aerodrome Slipstream is such
+   a router and therefore has its own id (`7`).
 6. **The V2 adapter targets `swapExactTokensForTokens`.** Fee-on-transfer tokens are not supported:
-   Balancer's post-loan balance check and Ryo's exact repayment would fail.
-7. **`minAmountOut` defaults to 1, not to a percentage.** Encode explicit floors if the watcher
+   Balancer's post-loan balance check and Ryo's exact repayment would fail. The same applies to the
+   Aerodrome classic adapter.
+7. **Aerodrome classic takes hops, not a token path.** Each hop declares its own pool type
+   (stable or volatile), so a single `Swap` can mix both pool types across its hops.
+8. **Aerodrome Slipstream pools are identified by tick spacing, not a fee tier.** The watcher must
+   know the tick spacing of the target pool (commonly 1, 10 or 100 on Base).
+9. **`minAmountOut` defaults to 1, not to a percentage.** Encode explicit floors if the watcher
    needs per-hop slippage limits.
-8. **Primary routes are immutable.** Route changes require a redeploy; router permissions remain
-   mutable.
-9. **`maxTradeSize` is per borrowed asset, not per route.** Both routes and dynamic routes share the
-   same cap for a given asset.
+10. **Primary routes are immutable.** Route changes require a redeploy; router permissions remain
+    mutable. The two primary routes stay on Uniswap V3 and Uniswap V2; Aerodrome and Slipstream are
+    reached through the dynamic `execute` path.
+11. **`maxTradeSize` is per borrowed asset, not per route.** Both routes and dynamic routes share the
+    same cap for a given asset.
+12. **A router address is whitelisted per address, not per DEX.** Adding the Aerodrome Router lets
+    the watcher use `dexType 4`; adding the Slipstream SwapRouter lets it use `dexType 7`. Whitelisting
+    is required either way.

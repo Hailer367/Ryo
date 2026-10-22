@@ -13,6 +13,8 @@ import { IBalancerVault } from "./interfaces/IBalancerVault.sol";
 import { IFlashLoanRecipient } from "./interfaces/IFlashLoanRecipient.sol";
 import { ISwapRouter02 } from "./interfaces/ISwapRouter02.sol";
 import { IUniswapV2Router02 } from "./interfaces/IUniswapV2Router02.sol";
+import { IAerodromeRouter } from "./interfaces/IAerodromeRouter.sol";
+import { ISlipstreamSwapRouter } from "./interfaces/ISlipstreamSwapRouter.sol";
 
 /// @title Ryo
 /// @notice Atomic Balancer flash-loan arbitrage executor for Base.
@@ -38,16 +40,23 @@ contract Ryo is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient {
     /// @notice Uniswap V2-style adapter (`swapExactTokensForTokens`).
     uint8 public constant DEX_UNISWAP_V2 = 8;
 
+    /// @notice Aerodrome classic adapter (volatile and stable pools).
+    /// @dev Aerodrome's router takes a list of route hops instead of a plain token path.
+    uint8 public constant DEX_AERODROME = 4;
+
+    /// @notice Aerodrome Slipstream adapter (concentrated liquidity).
+    /// @dev Slipstream identifies pools by tick spacing instead of a Uniswap V3 fee tier.
+    uint8 public constant DEX_SLIPSTREAM = 7;
+
     // Reserved for future adapters. Do NOT reuse these ids.
     // 1 = canonical Uniswap V2
     // 2 = SushiSwap V2
     // 3 = PancakeSwap V2
-    // 4 = Aerodrome
     // 5 = Curve
-    // 7 = Algebra / Uniswap V3 forks with a different router ABI
     // 9 = WOOFi
     // 10 = Maverick
-    // 11..255 = free
+    // 11 = Algebra (concentrated liquidity with yet another router ABI)
+    // 12..255 = free
 
     // --------------------------------------------------------------------------------------------
     // Types
@@ -509,7 +518,7 @@ contract Ryo is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient {
             }
 
             uint8 dexType = s.dexType;
-            if (dexType != DEX_UNISWAP_V3 && dexType != DEX_UNISWAP_V2) {
+            if (!_isSupportedDexType(dexType)) {
                 revert UnsupportedDexType(dexType);
             }
 
@@ -525,10 +534,37 @@ contract Ryo is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient {
     }
 
     function _validateExtraData(Swap calldata s, uint256 index) private pure {
-        if (s.dexType == DEX_UNISWAP_V3) {
+        uint8 dexType = s.dexType;
+
+        if (dexType == DEX_UNISWAP_V3) {
             uint256 v3Len = s.extraData.length;
             // abi.encode(uint24 fee) or abi.encode(uint24 fee, uint256 minAmountOut)
             if (v3Len != 32 && v3Len != 64) revert InvalidExtraData(index);
+            return;
+        }
+
+        if (dexType == DEX_SLIPSTREAM) {
+            uint256 slLen = s.extraData.length;
+            // abi.encode(int24 tickSpacing) or abi.encode(int24 tickSpacing, uint256 minAmountOut)
+            if (slLen != 32 && slLen != 64) revert InvalidExtraData(index);
+            return;
+        }
+
+        if (dexType == DEX_AERODROME) {
+            uint256 aeroLen = s.extraData.length;
+            // abi.encode(address[] path, bool[] stablePerHop, uint256 minAmountOut)
+            if (aeroLen < 256 || aeroLen % 32 != 0) revert InvalidExtraData(index);
+
+            (address[] memory path, bool[] memory stablePerHop) =
+                abi.decode(s.extraData, (address[], bool[]));
+            uint256 pathLen = path.length;
+            if (stablePerHop.length != pathLen - 1) revert InvalidPath(index);
+            _validatePath(path, s.tokenIn, s.tokenOut, index);
+            // Canonical encoding only: two offsets, the output floor, and two array lengths, plus
+            // one word per path entry and per hop flag.
+            if (aeroLen != 32 * (5 + pathLen + stablePerHop.length)) {
+                revert InvalidExtraData(index);
+            }
             return;
         }
 
@@ -541,8 +577,17 @@ contract Ryo is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient {
         if (v2Len < 160 || v2Len % 32 != 0) revert InvalidExtraData(index);
 
         address[] memory path = abi.decode(s.extraData, (address[]));
+        _validatePath(path, s.tokenIn, s.tokenOut, index);
+    }
+
+    /// @dev Shared path check: at least two tokens, no zero addresses, and the path must start at
+    ///      `tokenIn` and end at `tokenOut`.
+    function _validatePath(address[] memory path, address tokenIn, address tokenOut, uint256 index)
+        private
+        pure
+    {
         uint256 pathLen = path.length;
-        if (pathLen < 2 || path[0] != s.tokenIn || path[pathLen - 1] != s.tokenOut) {
+        if (pathLen < 2 || path[0] != tokenIn || path[pathLen - 1] != tokenOut) {
             revert InvalidPath(index);
         }
         for (uint256 j = 0; j < pathLen;) {
@@ -638,7 +683,94 @@ contract Ryo is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient {
             return _swapV2Path(s.router, path, s.tokenIn, s.tokenOut, amountIn, minOut, index);
         }
 
+        if (dexType == DEX_AERODROME) {
+            (address[] memory path, bool[] memory stablePerHop, uint256 minOut) =
+                _aerodromeParams(s, index);
+            return _swapAerodrome(
+                s.router, path, stablePerHop, s.tokenIn, s.tokenOut, amountIn, minOut, index
+            );
+        }
+
+        if (dexType == DEX_SLIPSTREAM) {
+            (int24 tickSpacing, uint256 minOut) = _decodeSlipstreamExtra(s.extraData);
+            return _swapSlipstream(
+                s.router, s.tokenIn, s.tokenOut, tickSpacing, amountIn, minOut, index
+            );
+        }
+
         revert UnsupportedDexType(dexType);
+    }
+
+    /// @dev Aerodrome classic swap (volatile and stable pools).
+    ///
+    ///      Aerodrome's router pulls the input token from this contract, so the router is approved
+    ///      for the exact input amount. The router takes one hop per pair of path entries, and each
+    ///      hop states whether its pool is a stable (pegged) pool or a volatile one. The pool
+    ///      factory is left as address(0), which means "the router's default factory".
+    function _swapAerodrome(
+        address router,
+        address[] memory path,
+        bool[] memory stablePerHop,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minOut,
+        uint256 index
+    ) internal returns (uint256 amountOut) {
+        IERC20(tokenIn).forceApprove(router, amountIn);
+
+        uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
+
+        uint256 hops = path.length - 1;
+        IAerodromeRouter.Route[] memory routes = new IAerodromeRouter.Route[](hops);
+        for (uint256 i = 0; i < hops;) {
+            routes[i] = IAerodromeRouter.Route({
+                from: path[i], to: path[i + 1], stable: stablePerHop[i], factory: address(0)
+            });
+            unchecked {
+                ++i;
+            }
+        }
+
+        IAerodromeRouter(router)
+            .swapExactTokensForTokens(amountIn, minOut, routes, address(this), block.timestamp);
+
+        return _settle(tokenIn, tokenOut, router, balanceBefore, minOut, index);
+    }
+
+    /// @dev Aerodrome Slipstream swap (concentrated liquidity).
+    ///
+    ///      Slipstream identifies a pool by its tick spacing rather than a Uniswap V3 fee tier,
+    ///      and its router carries a deadline field that Uniswap's does not. The router pulls the
+    ///      input token from this contract, so the router is approved for the exact input amount.
+    function _swapSlipstream(
+        address router,
+        address tokenIn,
+        address tokenOut,
+        int24 tickSpacing,
+        uint256 amountIn,
+        uint256 minOut,
+        uint256 index
+    ) internal returns (uint256 amountOut) {
+        IERC20(tokenIn).forceApprove(router, amountIn);
+
+        uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
+
+        ISlipstreamSwapRouter(router)
+            .exactInputSingle(
+                ISlipstreamSwapRouter.ExactInputSingleParams({
+                    tokenIn: tokenIn,
+                    tokenOut: tokenOut,
+                    tickSpacing: tickSpacing,
+                    recipient: address(this),
+                    deadline: block.timestamp,
+                    amountIn: amountIn,
+                    amountOutMinimum: minOut,
+                    sqrtPriceLimitX96: 0
+                })
+            );
+
+        return _settle(tokenIn, tokenOut, router, balanceBefore, minOut, index);
     }
 
     /// @dev Approve exact amount, swap, reset approval, and measure output by balance difference.
@@ -656,13 +788,8 @@ contract Ryo is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient {
 
         uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
         _callExactInputSingle(router, tokenIn, tokenOut, fee, amountIn, minOut);
-        uint256 balanceAfter = IERC20(tokenOut).balanceOf(address(this));
 
-        _resetApproval(tokenIn, router);
-
-        if (balanceAfter < balanceBefore) revert SwapBalanceDecreased(index);
-        amountOut = balanceAfter - balanceBefore;
-        if (amountOut < minOut) revert InsufficientOutput(index, minOut, amountOut);
+        return _settle(tokenIn, tokenOut, router, balanceBefore, minOut, index);
     }
 
     function _swapV2Direct(
@@ -693,6 +820,20 @@ contract Ryo is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient {
         uint256 balanceBefore = IERC20(tokenOut).balanceOf(address(this));
         IUniswapV2Router02(router)
             .swapExactTokensForTokens(amountIn, minOut, path, address(this), block.timestamp);
+
+        return _settle(tokenIn, tokenOut, router, balanceBefore, minOut, index);
+    }
+
+    /// @dev Shared tail of every adapter: measure the real output by balance difference, reset the
+    ///      router approval, and enforce the non-zero output floor.
+    function _settle(
+        address tokenIn,
+        address tokenOut,
+        address router,
+        uint256 balanceBefore,
+        uint256 minOut,
+        uint256 index
+    ) private returns (uint256 amountOut) {
         uint256 balanceAfter = IERC20(tokenOut).balanceOf(address(this));
 
         _resetApproval(tokenIn, router);
@@ -722,7 +863,7 @@ contract Ryo is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient {
         uint24 fee,
         uint256 amountIn,
         uint256 minOut
-    ) private {
+    ) internal {
         assembly ("memory-safe") {
             let ptr := mload(0x40)
             mstore(0x40, add(ptr, 0xe4))
@@ -760,18 +901,22 @@ contract Ryo is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient {
     /// @dev dexType 6 extraData:
     ///      - 32 bytes: abi.encode(uint24 fee); minOut defaults to 1.
     ///      - 64 bytes: abi.encode(uint24 fee, uint256 minAmountOut).
-    ///      Assembly avoids a dynamic abi.decode for the common 32-byte case.
-    ///      Differential-tested against the plain reference in test/RyoAssembly.t.sol.
+    ///
+    ///      An assembly version of this decoder was written and measured against this plain one
+    ///      (test/RyoAssembly.t.sol). It came out 22 gas *slower*, so the plain decoder was kept.
+    ///      The plain version also rejects non-canonical encodings instead of silently masking
+    ///      the high bits of the fee.
     function _decodeV3Extra(bytes memory data) internal pure returns (uint24 fee, uint256 minOut) {
         uint256 len = data.length;
-        if (len != 32 && len != 64) revert InvalidExtraData(0);
-
-        assembly ("memory-safe") {
-            fee := and(mload(add(data, 0x20)), 0xffffff)
-            if eq(len, 64) { minOut := mload(add(data, 0x40)) }
+        if (len == 32) {
+            fee = abi.decode(data, (uint24));
+            minOut = 1;
+        } else if (len == 64) {
+            (fee, minOut) = abi.decode(data, (uint24, uint256));
+            if (minOut == 0) minOut = 1;
+        } else {
+            revert InvalidExtraData(0);
         }
-
-        if (minOut == 0) minOut = 1;
     }
 
     /// @dev dexType 8 extraData:
@@ -793,15 +938,54 @@ contract Ryo is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient {
         (path, minOut) = abi.decode(s.extraData, (address[], uint256));
         if (minOut == 0) minOut = 1;
 
+        _validatePath(path, s.tokenIn, s.tokenOut, index);
+    }
+
+    /// @dev dexType 4 extraData:
+    ///      - abi.encode(address[] path, bool[] stablePerHop, uint256 minAmountOut)
+    ///
+    ///      `path` is the token chain. `stablePerHop[i]` marks hop i (path[i] -> path[i+1]) as a
+    ///      stable pool when true and a volatile pool when false. `stablePerHop.length` must be
+    ///      exactly `path.length - 1`.
+    function _aerodromeParams(Swap memory s, uint256 index)
+        private
+        pure
+        returns (address[] memory path, bool[] memory stablePerHop, uint256 minOut)
+    {
+        (path, stablePerHop, minOut) = abi.decode(s.extraData, (address[], bool[], uint256));
+
         uint256 pathLen = path.length;
-        if (pathLen < 2 || path[0] != s.tokenIn || path[pathLen - 1] != s.tokenOut) {
-            revert InvalidPath(index);
+        if (stablePerHop.length != pathLen - 1) revert InvalidPath(index);
+        _validatePath(path, s.tokenIn, s.tokenOut, index);
+
+        // Canonical encoding only: two offsets, the output floor, and two array lengths, plus one
+        // word per path entry and per hop flag.
+        if (s.extraData.length != 32 * (5 + pathLen + stablePerHop.length)) {
+            revert InvalidExtraData(index);
         }
-        for (uint256 j = 0; j < pathLen;) {
-            if (path[j] == address(0)) revert InvalidPath(index);
-            unchecked {
-                ++j;
-            }
+
+        if (minOut == 0) minOut = 1;
+    }
+
+    /// @dev dexType 7 extraData:
+    ///      - 32 bytes: abi.encode(int24 tickSpacing); minOut defaults to 1.
+    ///      - 64 bytes: abi.encode(int24 tickSpacing, uint256 minAmountOut).
+    ///      Plain decoding is used here because the tick spacing is a signed value: hand-rolled
+    ///      assembly would have to sign-extend it, and this path is not hot enough to justify that.
+    function _decodeSlipstreamExtra(bytes memory data)
+        private
+        pure
+        returns (int24 tickSpacing, uint256 minOut)
+    {
+        uint256 len = data.length;
+        if (len == 32) {
+            tickSpacing = abi.decode(data, (int24));
+            minOut = 1;
+        } else if (len == 64) {
+            (tickSpacing, minOut) = abi.decode(data, (int24, uint256));
+            if (minOut == 0) minOut = 1;
+        } else {
+            revert InvalidExtraData(0);
         }
     }
 
@@ -842,8 +1026,15 @@ contract Ryo is IFlashLoanRecipient, Ownable2Step, ReentrancyGuardTransient {
     }
 
     /// @notice True for dexType ids implemented in this deployment.
+    /// @dev 6 = Uniswap V3 / SwapRouter02, 8 = Uniswap V2-style, 4 = Aerodrome classic,
+    ///      7 = Aerodrome Slipstream (concentrated liquidity).
     function isSupportedDexType(uint8 dexType) external pure returns (bool) {
-        return dexType == DEX_UNISWAP_V3 || dexType == DEX_UNISWAP_V2;
+        return _isSupportedDexType(dexType);
+    }
+
+    function _isSupportedDexType(uint8 dexType) private pure returns (bool) {
+        return dexType == DEX_UNISWAP_V3 || dexType == DEX_UNISWAP_V2 || dexType == DEX_AERODROME
+            || dexType == DEX_SLIPSTREAM;
     }
 
     function _validatePrimaryRoute(uint8 routeId, PrimaryRouteConfig memory r) private pure {

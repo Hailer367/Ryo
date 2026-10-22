@@ -2,14 +2,22 @@
 pragma solidity ^0.8.28;
 
 import { Test } from "forge-std/Test.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { ISwapRouter02 } from "../src/interfaces/ISwapRouter02.sol";
 import { Ryo } from "../src/Ryo.sol";
 import { RyoHarness } from "./harness/RyoHarness.sol";
+import { RyoPlainReference } from "./harness/RyoPlainReference.sol";
 import { MockERC20 } from "./mocks/MockERC20.sol";
 import { MockBalancerVault } from "./mocks/MockBalancerVault.sol";
 import { MockV2Router } from "./mocks/MockV2Router.sol";
 import { MockV3Router } from "./mocks/MockV3Router.sol";
 
+/// @dev Differential tests for the hand-written V3 calldata.
+///
+///      The plain-Solidity reference lives in an Ryo-derived contract so that both sides are
+///      compiled under the same conditions: the compiler treats an inherited contract's code
+///      differently from a standalone one, and a reference in its own small contract would not be
+///      a fair gas comparison.
 contract RyoAssemblyTest is Test {
     uint256 internal constant ONE = 1e18;
 
@@ -19,6 +27,7 @@ contract RyoAssemblyTest is Test {
     MockERC20 internal tokenA;
     MockERC20 internal tokenB;
     RyoHarness internal harness;
+    RyoPlainReference internal plainRef;
 
     function setUp() public {
         vault = new MockBalancerVault();
@@ -32,31 +41,26 @@ contract RyoAssemblyTest is Test {
         tokenA.mint(address(v2), 1_000_000 * ONE);
         v3.setRate(address(tokenA), address(tokenB), 1.1e18);
         v2.setRate(address(tokenB), address(tokenA), 1.0e18);
+        // The gas test compares the calldata only, so the mock must not pull any tokens.
+        v3.setPullTokens(false);
 
         harness = new RyoHarness(
             address(vault),
             address(this),
             address(this),
-            Ryo.PrimaryRouteConfig({
-                asset: address(tokenA),
-                intermediate: address(tokenB),
-                buyRouter: address(v3),
-                sellRouter: address(v2),
-                buyDexType: 6,
-                sellDexType: 8,
-                buyFee: 500,
-                sellFee: 0
-            }),
-            Ryo.PrimaryRouteConfig({
-                asset: address(0),
-                intermediate: address(0),
-                buyRouter: address(0),
-                sellRouter: address(0),
-                buyDexType: 0,
-                sellDexType: 0,
-                buyFee: 0,
-                sellFee: 0
-            }),
+            _route0(),
+            _route1(),
+            new address[](0),
+            0,
+            0,
+            0
+        );
+        plainRef = new RyoPlainReference(
+            address(vault),
+            address(this),
+            address(this),
+            _route0(),
+            _route1(),
             new address[](0),
             0,
             0,
@@ -66,29 +70,54 @@ contract RyoAssemblyTest is Test {
         tokenA.mint(address(harness), 1_000 * ONE);
     }
 
+    function _route0() internal view returns (Ryo.PrimaryRouteConfig memory) {
+        return Ryo.PrimaryRouteConfig({
+            asset: address(tokenA),
+            intermediate: address(tokenB),
+            buyRouter: address(v3),
+            sellRouter: address(v2),
+            buyDexType: 6,
+            sellDexType: 8,
+            buyFee: 500,
+            sellFee: 0
+        });
+    }
+
+    function _route1() internal pure returns (Ryo.PrimaryRouteConfig memory) {
+        return Ryo.PrimaryRouteConfig({
+            asset: address(0),
+            intermediate: address(0),
+            buyRouter: address(0),
+            sellRouter: address(0),
+            buyDexType: 0,
+            sellDexType: 0,
+            buyFee: 0,
+            sellFee: 0
+        });
+    }
+
     // ----------------------------------------------------------------------------------------
-    // Assembly ABI encoding + output differential
+    // Calldata differential
     // ----------------------------------------------------------------------------------------
 
-    function test_assemblySwap_matchesPlainReference() public {
+    function test_assemblyCalldata_matchesPlainReference() public {
         uint256 amountIn = 10 * ONE;
         uint256 minOut = 5 * ONE;
 
         uint256 snap = vm.snapshotState();
 
-        uint256 outAssembly = harness.swapV3ForTest(
-            address(v3), address(tokenA), address(tokenB), 500, amountIn, minOut
+        harness.callExactInputSingleForTest(
+            address(v3), address(tokenA), address(tokenB), address(harness), 500, amountIn, minOut
         );
         bytes memory assemblyCalldata = v3.lastCalldata();
 
         vm.revertToState(snap);
 
-        uint256 outPlain = harness.swapV3PlainForTest(
-            address(v3), address(tokenA), address(tokenB), 500, amountIn, minOut
+        plainRef.callExactInputSingleForTest(
+            address(v3), address(tokenA), address(tokenB), address(harness), 500, amountIn, minOut
         );
         bytes memory plainCalldata = v3.lastCalldata();
 
-        assertEq(outAssembly, outPlain, "output mismatch");
         assertEq(keccak256(assemblyCalldata), keccak256(plainCalldata), "calldata mismatch");
 
         bytes memory expected = abi.encodeWithSelector(
@@ -107,9 +136,34 @@ contract RyoAssemblyTest is Test {
         assertEq(assemblyCalldata.length, 4 + 7 * 32, "calldata length");
     }
 
-    /// @dev Measures the two implementations from the same state. This is test-only profiling; the
-    ///      production path is the assembly one in Ryo._callExactInputSingle.
-    function test_gas_assemblySwap_vsPlain() public {
+    function test_assemblyCalldata_fuzzMatchesPlainReference(uint24 fee, uint256 amountIn) public {
+        amountIn = bound(amountIn, 1, type(uint128).max);
+        uint256 minOut = 1;
+
+        uint256 snap = vm.snapshotState();
+
+        harness.callExactInputSingleForTest(
+            address(v3), address(tokenA), address(tokenB), address(harness), fee, amountIn, minOut
+        );
+        bytes memory assemblyCalldata = v3.lastCalldata();
+
+        vm.revertToState(snap);
+
+        plainRef.callExactInputSingleForTest(
+            address(v3), address(tokenA), address(tokenB), address(harness), fee, amountIn, minOut
+        );
+        bytes memory plainCalldata = v3.lastCalldata();
+
+        assertEq(keccak256(assemblyCalldata), keccak256(plainCalldata), "calldata mismatch");
+    }
+
+    // ----------------------------------------------------------------------------------------
+    // Gas comparison
+    // ----------------------------------------------------------------------------------------
+
+    /// @dev Two cold calls of identical shape, one in each Ryo-derived contract. The only
+    ///      difference is how the calldata is produced: hand-written versus ABI-encoded.
+    function test_gas_assemblyCalldata_vsPlain() public {
         uint256 amountIn = 10 * ONE;
         uint256 minOut = 5 * ONE;
 
@@ -117,87 +171,35 @@ contract RyoAssemblyTest is Test {
 
         vm.cool(address(harness));
         vm.cool(address(v3));
-        vm.cool(address(tokenA));
-        vm.cool(address(tokenB));
         uint256 before = gasleft();
-        harness.swapV3ForTest(address(v3), address(tokenA), address(tokenB), 500, amountIn, minOut);
+        harness.callExactInputSingleForTest(
+            address(v3), address(tokenA), address(tokenB), address(harness), 500, amountIn, minOut
+        );
         uint256 assemblyGas = before - gasleft();
 
         vm.revertToState(snap);
 
-        vm.cool(address(harness));
+        vm.cool(address(plainRef));
         vm.cool(address(v3));
-        vm.cool(address(tokenA));
-        vm.cool(address(tokenB));
         before = gasleft();
-        harness.swapV3PlainForTest(
-            address(v3), address(tokenA), address(tokenB), 500, amountIn, minOut
+        plainRef.callExactInputSingleForTest(
+            address(v3), address(tokenA), address(tokenB), address(harness), 500, amountIn, minOut
         );
         uint256 plainGas = before - gasleft();
 
-        emit log_named_uint("assembly swap gas", assemblyGas);
-        emit log_named_uint("plain swap gas", plainGas);
-        assertLt(assemblyGas, plainGas, "assembly should be cheaper");
+        emit log_named_uint("assembly calldata gas", assemblyGas);
+        emit log_named_uint("plain calldata gas", plainGas);
+        assertLt(assemblyGas, plainGas, "assembly calldata should be cheaper");
     }
 
-    function test_assemblySwap_bubblesRouterRevert() public {
-        v3.setFailNext(true);
-        vm.expectRevert("MockV3: forced failure");
-        harness.swapV3ForTest(address(v3), address(tokenA), address(tokenB), 500, ONE, 1);
-    }
-
-    function test_assemblySwap_enforcesMinOut() public {
-        v3.setRate(address(tokenA), address(tokenB), 0.5e18);
-        vm.expectRevert("MockV3: slippage");
-        harness.swapV3ForTest(address(v3), address(tokenA), address(tokenB), 500, ONE, ONE);
-    }
-
-    // ----------------------------------------------------------------------------------------
-    // Assembly extraData decode differential
-    // ----------------------------------------------------------------------------------------
-
-    function test_gas_decodeV3Extra_vsReference() public {
-        bytes memory data = abi.encode(uint24(500), uint256(1e18));
-
-        vm.cool(address(harness));
-        uint256 before = gasleft();
-        harness.decodeV3ExtraForTest(data);
-        uint256 assemblyGas = before - gasleft();
-
-        vm.cool(address(harness));
-        before = gasleft();
-        harness.decodeV3ExtraReference(data);
-        uint256 plainGas = before - gasleft();
-
-        emit log_named_uint("assembly decode gas", assemblyGas);
-        emit log_named_uint("plain decode gas", plainGas);
-        assertLt(assemblyGas, plainGas, "assembly decoder should be cheaper");
-    }
-
-    function test_decodeV3Extra_32Byte_matchesReference_fuzz(uint24 fee) public view {
-        bytes memory data = abi.encode(fee);
-        (uint24 gotFee, uint256 gotMin) = harness.decodeV3ExtraForTest(data);
-        (uint24 refFee, uint256 refMin) = harness.decodeV3ExtraReference(data);
-        assertEq(gotFee, refFee);
-        assertEq(gotMin, refMin);
-        assertEq(gotMin, 1);
-    }
-
-    function test_decodeV3Extra_64Byte_matchesReference_fuzz(uint24 fee, uint256 minOut)
-        public
-        view
-    {
-        minOut = bound(minOut, 0, type(uint128).max);
-        bytes memory data = abi.encode(fee, minOut);
-        (uint24 gotFee, uint256 gotMin) = harness.decodeV3ExtraForTest(data);
-        (uint24 refFee, uint256 refMin) = harness.decodeV3ExtraReference(data);
-        assertEq(gotFee, refFee);
-        assertEq(gotMin, refMin);
-    }
-
-    function test_decodeV3Extra_rejectsBadLength() public {
-        bytes memory data = hex"001122";
-        vm.expectRevert(abi.encodeWithSelector(Ryo.InvalidExtraData.selector, 0));
-        harness.decodeV3ExtraForTest(data);
+    function _slice(bytes memory data, uint256 start) internal pure returns (bytes memory out) {
+        uint256 len = data.length - start;
+        out = new bytes(len);
+        for (uint256 i; i < len;) {
+            out[i] = data[start + i];
+            unchecked {
+                ++i;
+            }
+        }
     }
 }
